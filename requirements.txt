@@ -1,0 +1,11 @@
+Telethon==1.45.0
+cryptg==0.6.0
+httpx[socks]>=0.28.1,<0.29
+beautifulsoup4>=4.13,<5
+Pillow>=11.3,<13
+qrcode>=8.2,<9
+PySocks>=1.7.1,<2
+python-socks[asyncio]>=2.7.2,<3
+hachoir>=3.3,<4
+imageio-ffmpeg>=0.6,<0.7
+filelock>=3.20,<4

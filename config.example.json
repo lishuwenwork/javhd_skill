@@ -1,0 +1,10 @@
+{
+  "telegram_api_id": 0,
+  "telegram_api_hash": "",
+  "telegram_channel_id": 0,
+  "telegram_proxy": "",
+  "http_proxy": "",
+  "javhd_cookies_file": "",
+  "upload_concurrency": 6,
+  "notify_saved_messages": true
+}
