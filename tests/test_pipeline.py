@@ -24,6 +24,7 @@ import source
 import telegram
 from telethon import errors, functions, types
 import httpx
+from d1_testing import install_capture
 
 PAGE = "https://javhd.com/zh/id/123"
 HTML = '''<h1>示例中文标题</h1><meta property="og:image" content="https://cdn.example/cover.jpg">
@@ -32,6 +33,9 @@ HTML = '''<h1>示例中文标题</h1><meta property="og:image" content="https://
 
 
 class InputTests(unittest.TestCase):
+    def setUp(self):
+        self.capture = install_capture(self)
+
     def test_valid_tags_and_deduplication(self):
         self.assertEqual(common.parse_input("id:123 标签:#4k、#高清 #4k"), ("123", ["#4k", "#高清"]))
 
@@ -40,24 +44,25 @@ class InputTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(common.parse_input(text), ("123", []))
 
-    def test_numeric_tags_are_preserved_without_prefix(self):
-        self.assertEqual(common.parse_tags("#123"), ["#123"])
-        self.assertEqual(common.parse_input("id:64584 标签:#123、#4k"), ("64584", ["#123", "#4k"]))
-        self.assertEqual(common.parse_tags("#123 #456 #123"), ["#123", "#456"])
+    def test_numeric_tags_use_uppercase_id_prefix(self):
+        self.assertEqual(common.parse_tags("#123"), ["#ID123"])
+        self.assertEqual(common.parse_input("id:64584 标签:#123、#4k"), ("64584", ["#ID123", "#4k"]))
+        self.assertEqual(common.parse_tags("#123 #456 #123"), ["#ID123", "#ID456"])
+        self.assertEqual(common.parse_tags("#ID123 #123"), ["#ID123"])
         self.assertEqual(common.parse_tags("#id123"), ["#id123"])
         self.assertEqual(common.parse_tags("#4k"), ["#4k"])
 
     def test_id_tag_always_prepended_without_duplicates(self):
-        self.assertEqual(common.tags_with_id("64584", []), ["#64584"])
-        self.assertEqual(common.tags_with_id("64584", ["#4k"]), ["#64584", "#4k"])
-        self.assertEqual(common.tags_with_id("64584", ["#64584", "#4k"]), ["#64584", "#4k"])
-        self.assertEqual(common.tags_with_id("123", ["#123", "#高清", "#123"]), ["#123", "#高清"])
-        self.assertEqual(common.tags_with_id("123", ["#id123"]), ["#123", "#id123"])
+        self.assertEqual(common.tags_with_id("64584", []), ["#ID64584"])
+        self.assertEqual(common.tags_with_id("64584", ["#4k"]), ["#ID64584", "#4k"])
+        self.assertEqual(common.tags_with_id("64584", ["#ID64584", "#4k"]), ["#ID64584", "#4k"])
+        self.assertEqual(common.tags_with_id("123", ["#123", "#高清", "#ID123"]), ["#ID123", "#高清"])
+        self.assertEqual(common.tags_with_id("123", ["#id123"]), ["#ID123", "#id123"])
 
-    def test_numeric_id_caption_preserves_exact_tag_text(self):
+    def test_id_caption_uses_uppercase_prefix(self):
         caption, entities = common.caption_and_tags("标题", common.tags_with_id("123", ["#4k"]))
-        self.assertEqual(caption, "标题\n\n#123 #4k")
-        self.assertEqual([(entity.offset, entity.length) for entity in entities], [(4, 4), (9, 3)])
+        self.assertEqual(caption, "标题\n\n#ID123 #4k")
+        self.assertEqual([(entity.offset, entity.length) for entity in entities], [(4, 6), (11, 3)])
 
     def test_invalid_input_only_prints_format_hint(self):
         for text in ("123", "id:-1 标签:#高清", "id:0 标签:#高清", "id:12 标签:高清", "id:12 标签:#高清;whoami"):
@@ -73,7 +78,7 @@ class InputTests(unittest.TestCase):
             result_path.write_text('{"telegram":"success","quark":"success"}', encoding="utf-8")
             with FileLock(str(Path(temp) / "task.lock")):
                 self.assertEqual(main.main(["--id", "123", "--tags", "#高清"]), 1)
-            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result = self.capture.result("123")
             self.assertEqual(result["telegram"], "failed")
             self.assertEqual(result["quark"], "failed")
 
@@ -168,8 +173,9 @@ class SourceTests(unittest.IsolatedAsyncioTestCase):
             info = await source.resolve(client, "123")
         self.assertEqual(info.video_url, "https://cdn.example/full.mp4")
         self.assertEqual(info.preview_url, "")
-        self.assertEqual(len(requests), 3)
+        self.assertEqual(len(requests), 4)
         self.assertTrue(requests[1].endswith("videoId=7&is_trailer=0"))
+        self.assertTrue(requests[-1].endswith("videoId=7&is_trailer=1"))
 
 
 class UploadTests(unittest.IsolatedAsyncioTestCase):
@@ -424,7 +430,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
                                     video_meta={"width": 640, "height": 360, "duration": 20},
                                     preview_meta={"width": 480, "height": 270, "duration": 5})
             with self.assertRaises(common.JobError):
-                await uploader.upload(media, ["#123"])
+                await uploader.upload(media, ["#ID123"])
 
 
 class QuarkTests(unittest.TestCase):
@@ -452,9 +458,12 @@ class QuarkTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.capture = install_capture(self)
+
     async def exercise(self, failed=None, tags=("#高清",)):
         seen_paths = []
-        async def prepare(video_id, directory, config):
+        async def prepare(video_id, directory, config, **kwargs):
             path = directory / "video" / "示例中文标题.mp4"
             path.parent.mkdir()
             path.write_bytes(b"test")
@@ -473,10 +482,16 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(telegram, "Telegram", return_value=tg), patch.object(quark, "Quark", return_value=q), \
                 redirect_stdout(StringIO()):
             code = await main.operate({"notify_saved_messages": True}, video_id="123", tags=list(tags))
-            result = json.loads((Path(temp) / ".state/result-123.json").read_text(encoding="utf-8"))
+            result = self.capture.result("123")
             self.assertTrue(seen_paths)
-            self.assertFalse(seen_paths[0].exists())
-        self.assertTrue(result["cleaned"])
+            self.assertEqual(seen_paths[0].exists(), bool(failed))
+            if failed:
+                self.assertTrue(result["retained"])
+                self.assertTrue(result["awaiting_decision"])
+                self.assertEqual(Path(result["retained_dir"]), seen_paths[0].parent.parent)
+                self.assertIn("等待选择删除或重试", result["notification"])
+                self.assertNotIn("本地清理失败", result["notification"])
+        self.assertEqual(result["cleaned"], not bool(failed))
         self.assertTrue(result["saved_message"])
         self.assertNotIn("敏感", result["notification"])
         self.assertNotIn("sensitive", json.dumps(result))
@@ -488,13 +503,13 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_both_success_cleanup_and_minimal_notification(self):
         code, result, _ = await self.exercise()
         self.assertEqual(code, 0)
-        self.assertEqual(result["notification"], "id:123 上传成功")
+        self.assertEqual(result["notification"], "id:123 上传成功", result["errors"])
 
     async def test_telegram_always_receives_id_hashtag(self):
         _, _, tg = await self.exercise()
-        self.assertEqual(tg.upload.call_args.args[1], ["#123", "#高清"])
+        self.assertEqual(tg.upload.call_args.args[1], ["#ID123", "#高清"])
         _, _, tg = await self.exercise(tags=())
-        self.assertEqual(tg.upload.call_args.args[1], ["#123"])
+        self.assertEqual(tg.upload.call_args.args[1], ["#ID123"])
 
     async def test_one_failure_does_not_hide_other_success(self):
         for failed in ("telegram", "quark"):

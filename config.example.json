@@ -2,9 +2,15 @@
   "telegram_api_id": 0,
   "telegram_api_hash": "",
   "telegram_channel_id": 0,
+  "telegram_premium": false,
+  "telegram_split_direction": "tail",
   "telegram_proxy": "",
   "http_proxy": "",
   "javhd_cookies_file": "",
   "upload_concurrency": 6,
-  "notify_saved_messages": true
+  "notify_saved_messages": true,
+  "ACCOUNT_ID": "",
+  "DATABASE_ID": "",
+  "API_TOKEN": "",
+  "SNOWFLAKE_INSTANCE_ID": 0
 }

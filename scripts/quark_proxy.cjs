@@ -9,6 +9,20 @@ const net = require('node:net');
 const { URL, urlToHttpOptions } = require('node:url');
 const { syncBuiltinESMExports } = require('node:module');
 
+// Python 子进程没有交互式控制台时，仍能调用官方 CLI 的 Ctrl+C 保存断点处理。
+// 不改 vendor、不读取授权；专用临时文件仅由当前父进程创建。
+const stopFile = process.env.JAVHD_QUARK_STOP_FILE;
+if (stopFile) {
+  const fs = require('node:fs');
+  const stopPoll = setInterval(() => {
+    if (fs.existsSync(stopFile) && process.listenerCount('SIGINT') > 0) {
+      clearInterval(stopPoll);
+      process.emit('SIGINT');
+    }
+  }, 100);
+  stopPoll.unref();
+}
+
 const originalHttpRequest = http.request.bind(http);
 const originalHttpsRequest = https.request.bind(https);
 const proxyValue = process.env.JAVHD_QUARK_PROXY || '';

@@ -17,7 +17,7 @@ import httpx
 import imageio_ffmpeg
 from PIL import Image, ImageOps
 
-from common import JobError, ROOT
+from common import JobError, ROOT, detail_page_url
 
 SITE = "https://javhd.com"
 HAN = re.compile(r"[㐀-鿿]")
@@ -33,6 +33,7 @@ class VideoInfo:
     preview_url: str
     video_url: str
     expected_duration: float = 0
+    title_en: str = ""
 
 
 @dataclass
@@ -98,6 +99,7 @@ def inspect_detail(html: str, page: str, video_id: str) -> dict:
               meta_title.get("content", "") if meta_title else ""]
     title = next((re.sub(r"\s+", " ", str(value)).strip() for value in titles
                   if HAN.search(str(value)) and not KANA.search(str(value))), "")
+    title_en = next((english_title(value) for value in titles if english_title(value)), "")
 
     meta_cover = soup.select_one('meta[property="og:image"]')
     cover = (meta_cover.get("content", "") if meta_cover else "") or data.get("thumbnailUrl", "")
@@ -122,9 +124,15 @@ def inspect_detail(html: str, page: str, video_id: str) -> dict:
     duration = str(data.get("duration") or (durations[0] if len(set(durations)) == 1 else ""))
     match = re.fullmatch(r"P?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", duration)
     seconds = sum(float(n or 0) * unit for n, unit in zip(match.groups(), (3600, 60, 1))) if match else 0
-    return {"title": title, "cover_url": web_url(cover, page), "preview_url": web_url(preview, page),
+    return {"title": title, "title_en": title_en, "cover_url": web_url(cover, page), "preview_url": web_url(preview, page),
             "expected_duration": seconds, "player_endpoint": endpoint, "player_error": player_error,
             "is_trailer": trailer, "player_role": player.get("role", "") if player else ""}
+
+
+def english_title(value) -> str:
+    if not isinstance(value, str) or HAN.search(value) or KANA.search(value) or not re.search(r"[A-Za-z]", value):
+        return ""
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def parse_detail(html: str, page: str, video_id: str) -> tuple[dict, str]:
@@ -135,16 +143,20 @@ def parse_detail(html: str, page: str, video_id: str) -> tuple[dict, str]:
         raise JobError("该中文详情页没有提供中文标题；未擅自翻译或使用外文标题")
     if not data["cover_url"]:
         raise JobError("详情页没有提供当前视频的封面")
-    fields = {key: data[key] for key in ("title", "cover_url", "preview_url", "expected_duration")}
+    fields = {key: data[key] for key in ("title", "title_en", "cover_url", "preview_url", "expected_duration")}
     return fields, data["player_endpoint"]
 
 
 def full_player_endpoint(endpoint: str) -> str:
-    # 保留页面提供的内部 videoId、路由和其他参数，只选择完整源模式。
+    return player_mode_endpoint(endpoint, trailer=False)
+
+
+def player_mode_endpoint(endpoint: str, *, trailer: bool) -> str:
+    # 保留页面提供的内部 videoId、路由和其他参数，仅切换完整源/预告模式。
     parts = urlsplit(endpoint)
     query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
              if key != "is_trailer"]
-    query.append(("is_trailer", "0"))
+    query.append(("is_trailer", "1" if trailer else "0"))
     return parts._replace(query=urlencode(query)).geturl()
 
 
@@ -179,34 +191,80 @@ def best_source(data: dict, base: str) -> str:
 
 
 async def resolve_preview(client: httpx.AsyncClient, video_id: str, page: str,
-                          preview: str = "", playback: dict | None = None) -> str:
+                          preview: str = "", playback: dict | None = None, *, player_endpoint: str = "") -> str:
     if preview:
         return preview
     for key in ("gif", "gif_url", "previewUrl", "video-preview"):
         preview = web_url((playback or {}).get(key), page)
         if preview:
             return preview
-    # 当前公开 ID 的 CDN 短预览：必须实际返回 MP4，不能只拼出地址就报成功。
-    if not re.fullmatch(r"[0-9]+", video_id) or int(video_id) <= 0:
+    # 普通页面可按公开 ID 定位；工作室的公开 ID、播放器 ID、媒体目录 ID 可能各不相同。
+    studio = re.search(r"/studio(?:/|$)", urlsplit(page).path, flags=re.I)
+    if not studio and re.fullmatch(r"[0-9]+", video_id) and int(video_id) > 0:
+        candidate = f"https://c4.cdnjhd.com/share2/trailers/{video_id}/5sec_1000_n.mp4"
+        if await checked_preview(client, candidate, page):
+            return candidate
+    try:
+        endpoint = urlsplit(player_endpoint)
+    except ValueError:
         return ""
-    candidate = f"https://c4.cdnjhd.com/share2/trailers/{video_id}/5sec_1000_n.mp4"
+    if (endpoint.netloc != urlsplit(page).netloc or endpoint.scheme not in {"http", "https"}
+            or endpoint.username or endpoint.password
+            or not re.fullmatch(r"/[a-z]{2}/(?:player_api|player/\d+)/?", endpoint.path)):
+        return ""
+    try:
+        body, final = await small_response(client, player_mode_endpoint(player_endpoint, trailer=True), ajax=True)
+        if urlsplit(final).netloc != urlsplit(page).netloc:
+            return ""
+        data = json.loads(body)
+        sources = data.get("sources") if isinstance(data, dict) else None
+        if not isinstance(sources, list):
+            return ""
+    except (httpx.HTTPError, JobError, ValueError):
+        return ""
+    short, supplied = [], []
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        try:
+            candidate = web_url(item.get("src"), final)
+            parts = urlsplit(candidate)
+        except ValueError:
+            continue
+        # 仅从当前视频的预告接口取目录；完整源即使接口忽略 is_trailer 也不能冒充预览。
+        match = re.fullmatch(r"(.*/trailers?/[0-9]+)/[^/]+\.mp4", parts.path, flags=re.I)
+        if not candidate or not match:
+            continue
+        short.append(parts._replace(path=match[1] + "/5sec_1000_n.mp4").geturl())
+        supplied.append(candidate)
+        if len(supplied) == 3:
+            break
+    # 优先短预览，其次接口提供的预告；候选去重，每次只读 MP4 文件头。
+    for candidate in dict.fromkeys([*short, *supplied]):
+        if await checked_preview(client, candidate, page):
+            return candidate
+    return ""
+
+
+async def checked_preview(client: httpx.AsyncClient, candidate: str, page: str) -> bool:
+    """只读前 64 字节；CDN 忽略 Range 时也不继续读取整段预览。"""
     try:
         async with client.stream("GET", candidate, headers={
             "Range": "bytes=0-63", "Referer": page, "Accept-Encoding": "identity",
         }) as response:
             response.raise_for_status()
             if response.status_code not in (200, 206):
-                return ""
+                return False
             prefix = bytearray()
             async for chunk in response.aiter_raw(64):
                 prefix.extend(chunk[:64 - len(prefix)])
                 if len(prefix) == 64:
                     break
             if prefix[4:8] == b"ftyp":
-                return candidate
+                return True
     except httpx.HTTPError:
         pass
-    return ""
+    return False
 
 
 def mp4_duration(data: bytes) -> float:
@@ -297,14 +355,20 @@ async def small_response(client: httpx.AsyncClient, url: str, *, ajax=False) -> 
         return bytes(chunks), str(response.url)
 
 
-async def resolve(client: httpx.AsyncClient, video_id: str) -> VideoInfo:
-    body, page = await small_response(client, f"{SITE}/zh/id/{video_id}")
+async def resolve(client: httpx.AsyncClient, video_id: str, *, page_url: str = "") -> VideoInfo:
+    try:
+        requested = detail_page_url(page_url) if page_url else f"{SITE}/zh/id/{video_id}"
+    except ValueError:
+        raise JobError("详情页 URL 无效，请提供 JAVHD 的完整 HTTP(S) 详情页地址") from None
+    body, page = await small_response(client, requested)
     if not (urlsplit(page).hostname == "javhd.com" or (urlsplit(page).hostname or "").endswith(".javhd.com")):
         raise JobError("详情页跳转到了其他站点")
     fields, endpoint = parse_detail(body.decode("utf-8", errors="replace"), page, video_id)
     data, final = await load_playback(client, endpoint, page)
+    fields["title_en"] = english_title(data.get("title")) or fields["title_en"]
     video_url = best_source(data, final)
-    fields["preview_url"] = await resolve_preview(client, video_id, page, fields["preview_url"], data)
+    fields["preview_url"] = await resolve_preview(client, video_id, page, fields["preview_url"], data,
+                                                   player_endpoint=endpoint)
     return VideoInfo(video_id, page_url=page, video_url=video_url, **fields)
 
 
@@ -401,9 +465,11 @@ def website_client(config: dict) -> httpx.AsyncClient:
     )
 
 
-async def prepare_media(video_id: str, work: Path, config: dict) -> MediaFiles:
+async def prepare_media(video_id: str, work: Path, config: dict, *, page_url: str = "", on_resolved=None) -> MediaFiles:
     async with website_client(config) as client:
-        info = await resolve(client, video_id)
+        info = await resolve(client, video_id, **({"page_url": page_url} if page_url else {}))
+        if on_resolved is not None:
+            await on_resolved(info)
         video = await download(client, info.video_url, work / "video" / chinese_filename(info.title),
                                referer=info.page_url, video=True)
         # 无 Content-Length 时也检查容器是否截断；不对整个视频重新编码。

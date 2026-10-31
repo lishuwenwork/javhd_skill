@@ -9,3 +9,4 @@ python-socks[asyncio]>=2.7.2,<3
 hachoir>=3.3,<4
 imageio-ffmpeg>=0.6,<0.7
 filelock>=3.20,<4
+snowflake-id==1.0.2

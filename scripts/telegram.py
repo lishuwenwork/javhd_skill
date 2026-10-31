@@ -18,11 +18,13 @@ from telethon.network.connection import connection as telethon_connection
 
 from common import (STATE, JobError, caption_and_tags, check_crypto, emit, login_status,
                     show_qr)
+from telegram_media import MAX_VIDEO_SIZE, PREMIUM_MAX_VIDEO_SIZE, telegram_videos
 
 PART_SIZE = 512 * 1024
 DEFAULT_CONCURRENCY = 6
 # 协议允许同时保留多个未确认分块；上限防止单文件占满连接。
 MAX_IN_FLIGHT = 10
+MAX_ALBUM_ITEMS = 10
 BIG_FILE_THRESHOLD = 10 * 1024 * 1024
 FLOOD_ERRORS = (errors.FloodWaitError, errors.SlowModeWaitError, errors.FloodPremiumWaitError)
 
@@ -50,7 +52,7 @@ class FloodGate:
                 self.until = max(self.until, loop.time() + exc.seconds + 1)
 
 
-async def upload_parts(call, path: Path, concurrency: int = DEFAULT_CONCURRENCY):
+async def upload_parts(call, path: Path, concurrency: int = DEFAULT_CONCURRENCY, *, max_bytes: int = MAX_VIDEO_SIZE):
     """有界流水线：保持最多 min(并发数, 10) 个未确认分块，确认一块立刻补位。
 
     逐块读取并在工作线程中读盘，内存只保留有限分块；大文件用 InputFileBig，
@@ -62,6 +64,8 @@ async def upload_parts(call, path: Path, concurrency: int = DEFAULT_CONCURRENCY)
     size = stat.st_size
     if not size:
         raise JobError("不能上传空文件")
+    if size > max_bytes:
+        raise JobError("Telegram 单文件超过当前配置的上传上限")
     count = (size + PART_SIZE - 1) // PART_SIZE
     big = size > BIG_FILE_THRESHOLD
     file_id = helpers.generate_random_long()
@@ -219,44 +223,73 @@ class Telegram:
         raise JobError("找不到配置的频道；请确认账号已加入并拥有发布权限")
 
     async def upload(self, media, tags: list[str]) -> list[int]:
+        self.video_message_ids = []
         peer = await self.peer()
-        me = await self.call.run(self.client.get_me)
-        max_parts = 8000 if getattr(me, "premium", False) else 4000
-        if media.video.stat().st_size > max_parts * PART_SIZE:
-            raise JobError("视频超过当前 Telegram 账号的单文件上限；夸克上传仍独立进行")
         concurrency = self.config["upload_concurrency"]
-        caption, entities = caption_and_tags(media.info.title, tags)
-        cover_file = await upload_parts(self.call, media.cover, concurrency)
-        photo = await self.call(functions.messages.UploadMediaRequest(
-            peer, types.InputMediaUploadedPhoto(file=cover_file)))
-        cover = utils.get_input_photo(photo.photo)
-        thumb = await upload_parts(self.call, media.thumb, concurrency)
+        premium = self.config.get("telegram_premium", False)
+        max_bytes = PREMIUM_MAX_VIDEO_SIZE if premium else MAX_VIDEO_SIZE
+        sent_ids = []
+        async with telegram_videos(media, premium=premium,
+                                   direction=self.config.get("telegram_split_direction", "tail"),
+                                   retain=bool(getattr(media, "retain_work_files", False))) as videos:
+            cover_file = await upload_parts(self.call, media.cover, concurrency, max_bytes=max_bytes)
+            photo = await self.call(functions.messages.UploadMediaRequest(
+                peer, types.InputMediaUploadedPhoto(file=cover_file)))
+            cover = utils.get_input_photo(photo.photo)
 
-        async def document(path, metadata, *, preview=False):
-            file = await upload_parts(self.call, path, concurrency)
-            attributes = [types.DocumentAttributeFilename(file_name=path.name),
-                          types.DocumentAttributeVideo(
-                              duration=metadata["duration"], w=metadata["width"], h=metadata["height"],
-                              supports_streaming=True, nosound=True if preview else None)]
-            uploaded = types.InputMediaUploadedDocument(
-                file=file, mime_type="video/mp4", attributes=attributes,
-                nosound_video=True if preview else None, thumb=None if preview else thumb,
-                video_cover=None if preview else cover,
-            )
-            result = await self.call(functions.messages.UploadMediaRequest(peer, uploaded))
-            return types.InputMediaDocument(
-                id=utils.get_input_document(result.document), video_cover=None if preview else cover)
+            async def document(path, metadata, *, preview=False):
+                file = await upload_parts(self.call, path, concurrency, max_bytes=max_bytes)
+                attributes = [types.DocumentAttributeFilename(file_name=path.name),
+                              types.DocumentAttributeVideo(
+                                  duration=metadata["duration"], w=metadata["width"], h=metadata["height"],
+                                  supports_streaming=True, nosound=True if preview else None)]
+                # 缩略图为每段独立上传；封面是已确认的 Photo，可被各段引用。
+                thumb = None if preview else await upload_parts(self.call, media.thumb, concurrency, max_bytes=max_bytes)
+                uploaded = types.InputMediaUploadedDocument(
+                    file=file, mime_type="video/mp4", attributes=attributes,
+                    nosound_video=True if preview else None, thumb=thumb,
+                    video_cover=None if preview else cover,
+                )
+                result = await self.call(functions.messages.UploadMediaRequest(peer, uploaded))
+                return types.InputMediaDocument(
+                    id=utils.get_input_document(result.document), video_cover=None if preview else cover)
 
-        preview = await document(media.preview, media.preview_meta, preview=True)
-        video = await document(media.video, media.video_meta)
+            split = len(videos) > 1 or videos[0][0] != media.video
+            entries = [(media.preview, media.preview_meta, True, "")]
+            entries.extend((path, metadata, False,
+                            f"{media.info.title}({index}/{len(videos)})" if split else media.info.title)
+                           for index, (path, metadata) in enumerate(videos, 1))
+            offset = 0
+            try:
+                while offset < len(entries):
+                    count = min(MAX_ALBUM_ITEMS, len(entries) - offset)
+                    if len(entries) - offset - count == 1:
+                        count -= 1  # 避免最后一批只剩一个条目。
+                    items = []
+                    for path, metadata, preview, title in entries[offset:offset + count]:
+                        uploaded = await document(path, metadata, preview=preview)
+                        caption, entities = ("", None) if preview else caption_and_tags(title, tags)
+                        items.append(types.InputSingleMedia(
+                            media=uploaded, message=caption, entities=entities,
+                            random_id=helpers.generate_random_long(),
+                        ))
+                    confirmed = await self._publish_album(peer, items)
+                    sent_ids.extend(confirmed)
+                    self.video_message_ids.extend(message_id for entry, message_id
+                                                  in zip(entries[offset:offset + count], confirmed) if not entry[2])
+                    offset += count
+            except Exception as exc:
+                if sent_ids:
+                    raise JobError(f"电报已确认发布 {len(sent_ids)} 条消息，后续分段失败或未确认；"
+                                   "请先检查频道，不要重复执行") from exc
+                raise
+        return sent_ids
+
+    async def _publish_album(self, peer, items) -> list[int]:
         # 原始 GIF/Animated 文档不能进入视频相册，所以预览以无声视频发送。
         # random_id 让发送结果能按条目对上，避免只凭条数猜成功。
-        random_ids = [helpers.generate_random_long(), helpers.generate_random_long()]
-        request = functions.messages.SendMultiMediaRequest(peer=peer, multi_media=[
-            types.InputSingleMedia(media=preview, message="", random_id=random_ids[0]),
-            types.InputSingleMedia(media=video, message=caption, entities=entities,
-                                   random_id=random_ids[1]),
-        ])
+        random_ids = [item.random_id for item in items]
+        request = functions.messages.SendMultiMediaRequest(peer=peer, multi_media=items)
         result = await self.call(request)
         updates = getattr(result, "updates", [])
         mapping = {update.random_id: update.id for update in updates
@@ -267,7 +300,7 @@ class Telegram:
             raise JobError("相册发布结果无法确认；请先检查频道，不要直接重复发布")
         sent = [messages.get(mapping[random_id]) for random_id in random_ids]
         if any(message is None or not message.grouped_id for message in sent) \
-                or sent[0].grouped_id != sent[1].grouped_id:
+                or len({message.grouped_id for message in sent}) != 1:
             raise JobError("相册发布结果无法确认；请先检查频道，不要直接重复发布")
         return [message.id for message in sent]
 

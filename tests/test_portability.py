@@ -24,9 +24,12 @@ import package_skill
 import telegram
 
 TEST_CONFIG = {
+    "ACCOUNT_ID": "", "DATABASE_ID": "", "API_TOKEN": "", "SNOWFLAKE_INSTANCE_ID": 0,
     "telegram_api_id": 0,
     "telegram_api_hash": "",
     "telegram_channel_id": 0,
+    "telegram_premium": False,
+    "telegram_split_direction": "tail",
     "telegram_proxy": "",
     "http_proxy": "",
     "javhd_cookies_file": "",
@@ -151,7 +154,8 @@ class DistributionTests(unittest.TestCase):
             root = self.make_source(directory)
             marker = uuid.uuid4().hex
             for name in ("private-cookies.txt", ".state/telegram.session", ".state/quark/cookie.json",
-                         ".venv/private.txt", "downloads/video.mp4", "private.env", "config.backup.json"):
+                         ".state/uploaded-ids.json", ".venv/private.txt", "downloads/video.mp4", "private.env",
+                         "config.backup.json"):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(marker, encoding="utf-8")
@@ -237,6 +241,8 @@ class DistributionTests(unittest.TestCase):
                          {**TEST_CONFIG, "telegram_api_id": False},
                          {**TEST_CONFIG, "upload_concurrency": 0},
                          {**TEST_CONFIG, "upload_concurrency": True},
+                         {**TEST_CONFIG, "telegram_premium": "true"},
+                         {**TEST_CONFIG, "telegram_split_direction": "sideways"},
                          {**TEST_CONFIG, "notify_saved_messages": "true"}):
             with self.subTest(template_keys=list(template)), tempfile.TemporaryDirectory() as temp:
                 directory = Path(temp)

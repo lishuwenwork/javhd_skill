@@ -20,16 +20,25 @@ EMPTY_CONFIG_FIELDS = {
     "telegram_proxy": "",
     "http_proxy": "",
     "javhd_cookies_file": "",
+    "ACCOUNT_ID": "", "DATABASE_ID": "", "API_TOKEN": "",
 }
 FILES = (
     ".gitignore", "SKILL.md", "README.md", TEMPLATE_NAME, "requirements.txt",
-    "references/runtime.md",
-    "scripts/main.py", "scripts/common.py", "scripts/source.py", "scripts/telegram.py",
+    "references/runtime.md", "references/d1.md",
+    "scripts/main.py", "scripts/common.py", "scripts/source.py", "scripts/telegram.py", "scripts/telegram_media.py",
+    "scripts/task_files.py", "scripts/records.py", "schemas/d1.sql",
     "scripts/quark.py", "scripts/quark_proxy.cjs", "scripts/package_skill.py", "scripts/probe_video.py",
     "vendor/quarkclouddrive/scripts/quark-drive.cjs", "vendor/quarkclouddrive/scripts/hash-worker.cjs",
     "tests/quark_upload_test.py", "tests/quark_network_check.py",
     "tests/test_pipeline.py", "tests/test_login.py", "tests/test_media.py", "tests/test_portability.py",
     "tests/test_probe.py", "tests/test_quark_upload.py", "tests/test_quark_proxy.py", "tests/test_telegram_proxy.py",
+    "tests/test_telegram_split.py",
+    "tests/test_membership_history.py",
+    "tests/test_retained_tasks.py",
+    "tests/test_quark_resume.py",
+    "tests/test_detail_url.py", "tests/test_batch.py",
+    "tests/test_studio_preview.py",
+    "tests/d1_testing.py", "tests/test_records.py",
 )
 
 
@@ -45,9 +54,12 @@ def build_archive(root: Path, output: Path, *, overwrite=False) -> dict:
     template = json.loads((root / TEMPLATE_NAME).read_text(encoding="utf-8"))
     if not isinstance(template, dict):
         raise ValueError(f"{TEMPLATE_NAME} 必须是 JSON 对象")
-    expected_keys = set(EMPTY_CONFIG_FIELDS) | {"upload_concurrency", "notify_saved_messages"}
+    expected_keys = set(EMPTY_CONFIG_FIELDS) | {"telegram_premium", "telegram_split_direction",
+                                              "upload_concurrency", "notify_saved_messages", "SNOWFLAKE_INSTANCE_ID"}
     if set(template) != expected_keys:
         raise ValueError(f"{TEMPLATE_NAME} 必须包含全部支持的配置项，不能包含额外字段")
+    if type(template["SNOWFLAKE_INSTANCE_ID"]) is not int or not 0 <= template["SNOWFLAKE_INSTANCE_ID"] <= 1023:
+        raise ValueError(f"{TEMPLATE_NAME} 的 SNOWFLAKE_INSTANCE_ID 必须为 0 到 1023 的整数")
     for key, empty in EMPTY_CONFIG_FIELDS.items():
         if type(template[key]) is not type(empty) or template[key] != empty:
             raise ValueError(f"{TEMPLATE_NAME} 的 {key} 必须为空白默认值；个人配置请填写本地 config.json")
@@ -56,6 +68,10 @@ def build_archive(root: Path, output: Path, *, overwrite=False) -> dict:
         raise ValueError(f"{TEMPLATE_NAME} 的 upload_concurrency 必须是 1 到 16 的整数")
     if type(template["notify_saved_messages"]) is not bool:
         raise ValueError(f"{TEMPLATE_NAME} 的 notify_saved_messages 必须是布尔值")
+    if type(template["telegram_premium"]) is not bool:
+        raise ValueError(f"{TEMPLATE_NAME} 的 telegram_premium 必须是布尔值")
+    if template["telegram_split_direction"] not in ("head", "tail"):
+        raise ValueError(f"{TEMPLATE_NAME} 的 telegram_split_direction 必须是 head 或 tail")
     skill = (root / "SKILL.md").read_text(encoding="utf-8")
     header = skill.split("---", 2)[1] if skill.startswith("---\n") else ""
     if not re.search(rf"(?m)^name: {SKILL_NAME}$", header):

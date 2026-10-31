@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import httpx
 from PIL import Image
 
-from common import STATE, JobError, load_config, save_json
+from common import STATE, JobError, detail_page_url, load_config, save_json
 from source import (SITE, best_source, download, ffmpeg, full_player_endpoint, inspect_detail,
                     inspect_video_url, load_playback, prepare_cover, resolve_preview,
                     small_response, web_url, website_client)
@@ -31,8 +31,8 @@ def error_text(error: Exception) -> str:
     return type(error).__name__  # 不回显可能包含 Cookie 或签名的异常请求。
 
 
-async def probe(client: httpx.AsyncClient, video_id: str) -> dict:
-    result = {"id": video_id, "page_url": f"{SITE}/zh/id/{video_id}", "title_zh": "",
+async def probe(client: httpx.AsyncClient, video_id: str, *, page_url: str = "") -> dict:
+    result = {"id": video_id, "page_url": detail_page_url(page_url) if page_url else f"{SITE}/zh/id/{video_id}", "title_zh": "",
               "cover_url": "", "gif_url": "", "preview_url": "", "preview_format": "",
               "video_url": "", "full_video_url": "", "expected_duration_seconds": 0,
               "video_verification": {"status": "not_checked"}, "checks": {}, "notes": {}, "playback": {}}
@@ -65,7 +65,8 @@ async def probe(client: httpx.AsyncClient, video_id: str) -> dict:
             except Exception as exc:
                 result["playback"]["error"] = error_text(exc)
                 result["notes"]["full_video_url"] = error_text(exc)
-        result["preview_url"] = await resolve_preview(client, video_id, page, result["preview_url"], playback)
+        result["preview_url"] = await resolve_preview(client, video_id, page, result["preview_url"], playback,
+                                                       player_endpoint=data["player_endpoint"])
     except Exception as exc:
         result["notes"]["page"] = error_text(exc)
 
@@ -87,7 +88,7 @@ async def probe(client: httpx.AsyncClient, video_id: str) -> dict:
     if not result["full_video_url"]:
         result["notes"].setdefault("full_video_url", "完整源接口没有提供可用 MP4 地址")
     result["success"] = all(value == "ok" for value in result["checks"].values())
-    result["scope"] = "提取完整源 URL；CDN 短预览回退最多读取 64 字节；未下载完整视频"
+    result["scope"] = "提取完整源 URL；每个预览候选最多读取 64 字节；未下载完整视频"
     return result
 
 
@@ -142,14 +143,14 @@ async def save_assets(client: httpx.AsyncClient, result: dict, directory: Path) 
 
 
 async def run(video_id: str, output: Path, cookies_file: Path | None, assets: bool,
-              verify=False, anonymous=False) -> dict:
+              verify=False, anonymous=False, page_url="") -> dict:
     config = load_config()
     if anonymous:
         config["javhd_cookies_file"] = ""
     elif cookies_file:
         config["javhd_cookies_file"] = str(cookies_file.expanduser().resolve())
     async with website_client(config) as client:
-        result = await probe(client, video_id)
+        result = await probe(client, video_id, **({"page_url": page_url} if page_url else {}))
         if verify:
             await verify_video(client, result)
         if assets:
@@ -170,6 +171,7 @@ def format_result(result: dict) -> str:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--id", default="59152", help="默认测试真实 ID 59152")
+    parser.add_argument("--url", help="可选详情页 URL；传入后不按 ID 拼接地址")
     login = parser.add_mutually_exclusive_group()
     login.add_argument("--cookies-file", type=Path, help="可选：自己的 Netscape Cookie 文件")
     login.add_argument("--no-cookies", action="store_true", help="忽略本地 Cookie 配置，匿名测试")
@@ -180,6 +182,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[0-9]+", args.id) or int(args.id) <= 0:
         parser.error("--id 必须是正整数")
+    if args.url is not None:
+        try:
+            detail_page_url(args.url)
+        except ValueError:
+            parser.error("--url 必须是 JAVHD 的无凭据 HTTP(S) 详情页地址")
     output = args.output or STATE / "probes" / f"{args.id}-{uuid.uuid4().hex[:8]}"
     output = output.expanduser().resolve()
     try:
@@ -189,7 +196,8 @@ def main(argv=None) -> int:
         return 1
     try:
         result = asyncio.run(run(args.id, output, args.cookies_file, args.save_assets,
-                                verify=args.verify_video, anonymous=args.no_cookies))
+                                verify=args.verify_video, anonymous=args.no_cookies,
+                                **({"page_url": args.url} if args.url else {})))
     except Exception as exc:
         result = {"id": args.id, "success": False, "error": error_text(exc)}
     result["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

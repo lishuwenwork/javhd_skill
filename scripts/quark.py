@@ -16,6 +16,7 @@ import re
 import shutil
 import string
 import subprocess
+import tempfile
 import threading
 import time
 from urllib.parse import unquote, urlsplit
@@ -36,6 +37,7 @@ CHECKSUMS = {
 AGENT_ENV = {"CLAUDECODE": "1"}
 READY_TIMEOUT = 60
 COMMAND_TIMEOUT = 1800
+STOP_GRACE_SECONDS = 8
 MAX_LINE = 1024 * 1024
 PROXY_NAME = "quark_proxy.cjs"
 PROXY_SOURCE = Path(__file__).resolve().with_name(PROXY_NAME)
@@ -61,6 +63,40 @@ class ProxyConnectionError(JobError):
 
 class DirectConnectionError(JobError):
     """直连网络出错，不代表 OAuth 授权失效。"""
+
+
+def validate_checkpoint(checkpoint):
+    """只接受本项目的续传元数据；旧任务缺少该字段时由重试入口单独处理。"""
+    try:
+        if not isinstance(checkpoint, dict) or checkpoint.get("version") != 1 \
+                or type(checkpoint.get("attempted")) is not bool:
+            raise ValueError
+        if not checkpoint["attempted"]:
+            if set(checkpoint) != {"version", "attempted"}:
+                raise ValueError
+            return
+        if not isinstance(checkpoint["file_name"], str) or not checkpoint["file_name"] \
+                or Path(checkpoint["file_name"]).name != checkpoint["file_name"]:
+            raise ValueError
+        for name in ("file_size", "mtime_ns", "started_at"):
+            if type(checkpoint[name]) is not int or checkpoint[name] <= 0:
+                raise ValueError
+        if "ended_at" in checkpoint and (type(checkpoint["ended_at"]) is not int
+                                          or checkpoint["ended_at"] < checkpoint["started_at"]):
+            raise ValueError
+        def valid_id(value):
+            return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,256}", value)
+        if not valid_id(checkpoint["parent_fid"]):
+            raise ValueError
+        previous = checkpoint["previous_ids"]
+        if not isinstance(previous, list) or not all(valid_id(value) for value in previous):
+            raise ValueError
+        if checkpoint.get("record_id") is not None and not valid_id(checkpoint["record_id"]):
+            raise ValueError
+        if checkpoint.get("session_id") is not None and not valid_id(checkpoint["session_id"]):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise JobError("夸克断点信息格式异常，未重新上传") from None
 
 
 def proxy_settings(env=None) -> tuple[str, str]:
@@ -216,23 +252,46 @@ class QuarkCLI:
 
     def run(self, args, *, timeout=None, on_line=None) -> tuple[int, list[dict], str]:
         """所有命令均通过同一个预加载器；网络故障先于 OAuth 错误归类。"""
+        with tempfile.TemporaryDirectory(prefix="javhd-quark-stop-") as directory:
+            return self._run(args, timeout=timeout, on_line=on_line, stop_file=Path(directory) / "stop")
+
+    def _run(self, args, *, timeout, on_line, stop_file):
         if not self.node:
             raise JobError("夸克上传需要 Node.js，请安装后重试")
         if not self.script.is_file() or not self.preload.is_file():
             raise JobError("缺少官方夸克运行时或代理适配器，请重新安装本 skill")
         process = subprocess.Popen(
-            self._argv(args), cwd=str(self.script.parent.parent), env=self.env, stdin=subprocess.DEVNULL,
+            self._argv(args), cwd=str(self.script.parent.parent),
+            env={**self.env, "JAVHD_QUARK_STOP_FILE": str(stop_file)}, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
             errors="replace", bufsize=1,
         )
         lines, reasons, callback_errors = [], [], []
         expired = threading.Event()
+        stopping = threading.Event()
+        stop_lock = threading.Lock()
 
         def kill():
             try:
                 process.kill()
             except OSError:
                 pass
+
+        kill_timer = threading.Timer(STOP_GRACE_SECONDS, kill)
+        kill_timer.daemon = True
+
+        def request_stop():
+            with stop_lock:
+                if stopping.is_set():
+                    return
+                stopping.set()
+                try:
+                    stop_file.touch()
+                except OSError:
+                    kill()
+                    return
+                # 预加载器触发官方 SIGINT 保存流程；超出宽限仍强制退出。
+                kill_timer.start()
 
         def read_stdout():
             try:
@@ -257,7 +316,7 @@ class QuarkCLI:
                             on_line(payload)
             except Exception as exc:
                 callback_errors.append(exc)
-                kill()
+                request_stop()
 
         def read_stderr():
             with process.stderr:
@@ -278,7 +337,7 @@ class QuarkCLI:
 
         def expire():
             expired.set()
-            kill()
+            request_stop()
 
         threads = [threading.Thread(target=read_stdout, daemon=True),
                    threading.Thread(target=read_stderr, daemon=True)]
@@ -290,11 +349,16 @@ class QuarkCLI:
         try:
             code = process.wait()
         except BaseException:
-            kill()
-            process.wait()
+            request_stop()
+            try:
+                process.wait(timeout=STOP_GRACE_SECONDS + 1)
+            except subprocess.TimeoutExpired:
+                kill()
+                process.wait()
             raise
         finally:
             timer.cancel()
+            kill_timer.cancel()
             for thread in threads:
                 thread.join()
         if callback_errors:
@@ -425,11 +489,157 @@ class Quark:
             parent = fid
         return parent
 
-    def upload(self, media) -> str:
-        return self.upload_file(media.video, parent_folder_id=self.folder())
+    def upload(self, media, *, checkpoint=None, checkpoint_callback=None, retry=False) -> str:
+        if checkpoint_callback is None:
+            if retry:
+                raise JobError("夸克重试缺少断点保存入口，未重新上传")
+            return self.upload_file(media.video, parent_folder_id=self.folder())
+        return self.upload_resumable(media.video, checkpoint=checkpoint,
+                                     checkpoint_callback=checkpoint_callback, retry=retry)
+
+    def upload_records(self) -> list[dict]:
+        records, failures = [], []
+        def on_line(payload):
+            if payload.get("type") == "list":
+                if str(payload.get("code")) == "0" and isinstance(payload.get("data"), dict):
+                    records.append(payload["data"])
+                else:
+                    failures.append(error_text(payload))
+        final = self._result(["upload", "list"], timeout=READY_TIMEOUT, on_line=on_line)
+        if failures or type(final.get("totalCount")) is not int or final["totalCount"] != len(records):
+            raise JobError("夸克上传任务列表不完整，未重新上传")
+        ids = [record.get("recordId") for record in records]
+        if any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", value) for value in ids) \
+                or len(ids) != len(set(ids)):
+            raise JobError("夸克上传任务 ID 异常，未重新上传")
+        return records
+
+    def upload_resumable(self, path, *, checkpoint=None, checkpoint_callback, retry=False) -> str:
+        path, before = self._local_file(path)
+        if checkpoint is None and retry:
+            raise JobError("旧任务没有夸克断点信息；请先核查网盘，未重新上传")
+        if checkpoint is not None:
+            validate_checkpoint(checkpoint)
+        saved = dict(checkpoint or {"version": 1, "attempted": False})
+
+        def persist():
+            checkpoint_callback(dict(saved))
+
+        def matches(record):
+            return record.get("fileName") == path.name and type(record.get("fileSize")) is int \
+                and record["fileSize"] == before[0]
+
+        def discover(records):
+            # 没有收到终态行（例如超时）时，仅关联本次新建、同名同大小且时间范围内的唯一记录。
+            end = saved.get("ended_at", int(time.time() * 1000))
+            candidates = [record for record in records if matches(record)
+                          and record["recordId"] not in saved["previous_ids"]
+                          and type(record.get("createdAt")) is int
+                          and saved["started_at"] - 2000 <= record["createdAt"] <= end + 2000]
+            if len(candidates) != 1:
+                raise UploadUnconfirmed("无法唯一确认本次夸克断点（缺失或存在多个候选）；文件已保留，未重新上传")
+            saved["record_id"] = candidates[0]["recordId"]
+            persist()
+            return candidates[0]
+
+        if saved["attempted"]:
+            if (saved["file_name"], saved["file_size"], saved["mtime_ns"]) != (path.name, *before):
+                raise JobError("夸克断点对应的本地文件发生变化，未重新上传")
+            if saved.get("session_id"):
+                self.cli.session_id = saved["session_id"]
+            records = self.upload_records()
+            if saved.get("record_id"):
+                record = next((item for item in records if item["recordId"] == saved["record_id"]), None)
+                if record is None:
+                    raise UploadUnconfirmed("夸克断点不存在或已失效；文件已保留，未重新上传")
+            else:
+                record = discover(records)
+            if not matches(record):
+                raise UploadUnconfirmed("夸克断点与保留文件不匹配，未重新上传")
+            if record.get("state") == "success":
+                raise UploadUnconfirmed("夸克记录显示已完成，但原上传结果未确认；请先核查网盘，未重新上传")
+            if record.get("state") not in {"pending", "hashing", "uploading", "paused", "failed", "cancelled", "post_hashing"}:
+                raise UploadUnconfirmed("夸克断点状态异常，未重新上传")
+            return self.resume_file(path, saved["record_id"], expected_fingerprint=before)
+
+        parent = self.folder()
+        records = self.upload_records()
+        if self._local_file(path)[1] != before:
+            raise JobError("准备上传期间本地文件发生变化，未上传")
+        saved = {"version": 1, "attempted": True, "file_name": path.name, "file_size": before[0],
+                 "mtime_ns": before[1], "parent_fid": parent, "record_id": None,
+                 "previous_ids": [record["recordId"] for record in records if matches(record)],
+                 "started_at": int(time.time() * 1000), "session_id": getattr(self.cli, "session_id", None)}
+        # 必须先落盘再发上传请求；即使 CLI 无终态输出，也不会把重试降级成新上传。
+        persist()
+        def bind(record_id):
+            if saved.get("record_id") and saved["record_id"] != record_id:
+                raise UploadUnconfirmed("单文件上传返回多个任务 ID，未确认上传结果")
+            saved["record_id"] = record_id
+            persist()
+        try:
+            return self.upload_file(path, parent_folder_id=parent, record_callback=bind, expected_fingerprint=before)
+        except Exception:
+            saved["ended_at"] = max(saved["started_at"], int(time.time() * 1000))
+            persist()
+            if not saved.get("record_id"):
+                try:
+                    discover(self.upload_records())
+                except JobError:
+                    pass  # 原始错误仍如实返回；用户选择重试时可再次只读查询断点。
+            raise
+
+    @staticmethod
+    def _local_file(path):
+        try:
+            path = Path(path).expanduser().resolve()
+            stat = path.stat()
+        except (OSError, RuntimeError, ValueError):
+            raise JobError("无法读取本地上传文件，请核对保留任务目录") from None
+        if not path.is_file() or stat.st_size <= 0:
+            raise JobError("本地上传文件缺失或为空")
+        return path, (stat.st_size, stat.st_mtime_ns)
+
+    def resume_file(self, path, record_id: str, *, transfer_callback=None, expected_fingerprint=None) -> str:
+        """官方 resume 的 result 不带 fids；严格联合同一 record 的 list 和 result 确认。"""
+        if not isinstance(record_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", record_id):
+            raise JobError("夸克断点 ID 无效")
+        path, before = self._local_file(path)
+        if expected_fingerprint is not None and before != expected_fingerprint:
+            raise JobError("准备续传期间本地文件发生变化，未重新上传")
+        finished, failures = [], []
+        def on_line(payload):
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            if payload.get("type") == "progress":
+                current, total = data.get("current"), data.get("total")
+                if type(current) is int and type(total) is int and 0 <= current <= total and total > 0 and transfer_callback:
+                    transfer_callback(current, total)
+            elif payload.get("type") == "list":
+                if str(payload.get("code")) != "0":
+                    failures.append(error_text(payload))
+                elif data.get("recordId") == record_id and isinstance(data.get("fileId"), str) and data["fileId"] \
+                        and data.get("fileName") == path.name and data.get("fileSize") == before[0]:
+                    finished.append(data["fileId"])
+                else:
+                    failures.append("恢复结果与本次记录或文件不匹配")
+        try:
+            final = self._result(["upload", "resume", "--record-id", record_id, "--file-path", str(path)], on_line=on_line)
+        except (AuthRequired, ProxyConnectionError, DirectConnectionError):
+            raise
+        except JobError as exc:
+            raise UploadUnconfirmed(f"夸克断点续传未确认：{exc}；文件已保留，不会自动重新上传") from None
+        try:
+            _, after = self._local_file(path)
+        except JobError:
+            after = None
+        if after != before:
+            raise UploadUnconfirmed("续传期间本地文件发生变化；请先核查网盘，未确认上传成功")
+        if failures or len(finished) != 1 or final.get("recordId") != record_id:
+            raise UploadUnconfirmed("夸克断点续传未返回匹配的最终成功结果和文件 ID；请先核查网盘")
+        return finished[0]
 
     def upload_file(self, path: Path, *, parent_folder_id="0", progress_callback=None,
-                    transfer_callback=None) -> str:
+                    transfer_callback=None, record_callback=None, expected_fingerprint=None) -> str:
         # 按调用方 cwd 解析一次；CLI 的 cwd 是独立运行目录，不能再传相对路径。
         try:
             path = Path(path).expanduser().resolve()
@@ -445,6 +655,8 @@ class Quark:
             raise JobError(f"本地路径不是文件：{path}")
         if before[0] <= 0:
             raise JobError(f"本地文件为空：{path}")
+        if expected_fingerprint is not None and before != expected_fingerprint:
+            raise JobError("准备上传期间本地文件发生变化，未上传")
         finished, failures, final = {}, [], {}
 
         def on_line(payload):
@@ -455,6 +667,9 @@ class Quark:
                 if isinstance(current, int) and isinstance(total, int) and total > 0 and transfer_callback:
                     transfer_callback(min(current, total), total)
             elif kind == "list":
+                record_id = data.get("recordId")
+                if record_callback is not None and isinstance(record_id, str) and record_id:
+                    record_callback(record_id)
                 if str(payload.get("code")) == "0":
                     finished[data.get("fileId") or ""] = bool(data.get("instantUpload"))
                 else:
